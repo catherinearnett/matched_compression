@@ -229,8 +229,8 @@ def main():
             if rows:
                 pd.DataFrame(rows).to_csv(args.out, mode="a", header=False, index=False)
             done_count += 1
-            print(f"  → {len(rows)} CTC values written  "
-                  f"({', '.join(f'{r[\"flores_lang\"]}={r[\"ctc\"]}' for r in rows)})")
+            lang_ctc = ", ".join(r["flores_lang"] + "=" + str(r["ctc"]) for r in rows)
+            print(f"  → {len(rows)} CTC values written  ({lang_ctc})")
 
     print(f"\nDone. Processed: {done_count}  Errors: {err_count}")
     print(f"Results: {args.out}  ({pd.read_csv(args.out).shape[0]} rows)")
