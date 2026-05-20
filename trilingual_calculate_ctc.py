@@ -33,7 +33,7 @@ warnings.filterwarnings("ignore")
 SPM_DIR       = "trilingual_spm_tokenizers"
 FLORES_REPO   = "openlanguagedata/flores_plus"
 FLORES_SPLITS = ["dev", "devtest"]
-TEXT_COLUMN   = "sentence"
+TEXT_COLUMN   = "text"
 
 OUT_COLS = ["tokenizer", "l1", "l2", "l3", "r1", "r2", "r3", "flores_lang", "ctc"]
 
