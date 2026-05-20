@@ -2,8 +2,8 @@
 Calculate CTC (token count) for all trilingual SentencePiece tokenizers
 against FLORES+ for each of the three languages in the triple.
 
-Tokenizers are loaded from: catherinearnett/trilingual-tokenizers
-Each tokenizer stem: {l1}_{l2}_{l3}_{r1}_{r2}_{r3}
+Tokenizers are loaded locally from: trilingual_spm_tokenizers/
+Each .model file stem: {l1}_{l2}_{l3}_{r1}_{r2}_{r3}
 
 CTC = total non-special tokens across all sentences (dev + devtest).
 
@@ -17,20 +17,20 @@ Usage:
     python calculate_trilingual_ctc.py --out trilingual_ctc_results.csv --resume
 
 Requirements:
-    pip install transformers datasets pandas huggingface_hub sentencepiece
+    pip install sentencepiece datasets pandas huggingface_hub
 """
 
 import os
 import sys
+import glob
 import argparse
+import sentencepiece as spm
 import pandas as pd
-from huggingface_hub import HfApi
-from transformers import AutoTokenizer
 from datasets import load_dataset, get_dataset_config_names
 import warnings
 warnings.filterwarnings("ignore")
 
-TRI_REPO      = "catherinearnett/trilingual-tokenizers"
+SPM_DIR       = "trilingual_spm_tokenizers"
 FLORES_REPO   = "openlanguagedata/flores_plus"
 FLORES_SPLITS = ["dev", "devtest"]
 TEXT_COLUMN   = "sentence"
@@ -42,17 +42,11 @@ OUT_COLS = ["tokenizer", "l1", "l2", "l3", "r1", "r2", "r3", "flores_lang", "ctc
 
 def parse_stem(stem):
     """
-    Parse stem of the form:
-      {l1_script}_{l2_script}_{l3_script}_{r1}_{r2}_{r3}
+    Parse stem of the form: {l1}_{l2}_{l3}_{r1}_{r2}_{r3}
     e.g. gle_Latn_cym_Latn_swh_Latn_34_33_33
-
-    Language codes are always 8 chars (lang_Scpt), ratios are ints.
-    Strategy: split on '_', take first 6 parts as 3 x 2-part lang codes,
-    last 3 parts as ratios.
+    Parts: lang(2) script(1) lang(2) script(1) lang(2) script(1) r1 r2 r3 = 9 parts
     """
     parts = stem.split("_")
-    # Expect: lang(2) script(1) lang(2) script(1) lang(2) script(1) r1 r2 r3
-    # = 3*2 + 3 = 9 parts
     if len(parts) != 9:
         return None
     try:
@@ -67,26 +61,6 @@ def parse_stem(stem):
         return {"l1": l1, "l2": l2, "l3": l3, "r1": r1, "r2": r2, "r3": r3}
     except (ValueError, IndexError):
         return None
-
-
-# ── HF repo helpers ───────────────────────────────────────────────────────────
-
-def get_repo_stems(api, repo_id, token):
-    """List all top-level subdirectories (tokenizer stems) in a HF dataset repo."""
-    stems = []
-    try:
-        for item in api.list_repo_tree(
-            repo_id=repo_id,
-            repo_type="dataset",
-            path_in_repo="",
-            recursive=False,
-            token=token,
-        ):
-            if not hasattr(item, "rfilename") and hasattr(item, "path"):
-                stems.append(item.path)
-    except Exception as e:
-        print(f"  WARNING fetching stems from {repo_id}: {e}")
-    return stems
 
 
 # ── FLORES helpers ────────────────────────────────────────────────────────────
@@ -121,47 +95,44 @@ def load_flores_sentences(lang, token, flores_configs):
 
 # ── CTC ───────────────────────────────────────────────────────────────────────
 
-def compute_ctc(sentences, tokenizer):
-    special_ids = set(tokenizer.all_special_ids)
+def compute_ctc(sentences, sp):
+    """Count non-special tokens using SentencePiece model directly."""
     total = 0
     for sent in sentences:
-        ids = tokenizer(sent)["input_ids"]
-        total += sum(1 for t in ids if t not in special_ids)
+        pieces = sp.encode(sent, out_type=str)
+        total += len(pieces)
     return total
 
 
-def process_one(stem, info, flores_configs, token):
-    """Load tokenizer from HF and compute CTC for l1, l2, l3."""
+def process_one(stem, model_path, info, flores_configs, token):
+    """Load local .model file and compute CTC for l1, l2, l3."""
     try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            f"{TRI_REPO}/{stem}", token=token, trust_remote_code=False
-        )
+        sp = spm.SentencePieceProcessor()
+        sp.Load(model_path)
     except Exception as e:
-        return [], f"ERROR loading tokenizer {stem}: {e}"
-
-    target_langs = [info["l1"], info["l2"], info["l3"]]
+        return [], f"ERROR loading model {model_path}: {e}"
 
     rows = []
-    for flores_lang in target_langs:
+    for flores_lang in [info["l1"], info["l2"], info["l3"]]:
         sentences = load_flores_sentences(flores_lang, token, flores_configs)
         if sentences is None:
             print(f"  SKIP {flores_lang} (not in FLORES+)")
             continue
         try:
-            ctc = compute_ctc(sentences, tokenizer)
+            ctc = compute_ctc(sentences, sp)
         except Exception as e:
             print(f"  ERROR computing CTC for {flores_lang}: {e}")
             ctc = None
         rows.append({
-            "tokenizer":  stem,
-            "l1":         info["l1"],
-            "l2":         info["l2"],
-            "l3":         info["l3"],
-            "r1":         info["r1"],
-            "r2":         info["r2"],
-            "r3":         info["r3"],
+            "tokenizer":   stem,
+            "l1":          info["l1"],
+            "l2":          info["l2"],
+            "l3":          info["l3"],
+            "r1":          info["r1"],
+            "r2":          info["r2"],
+            "r3":          info["r3"],
             "flores_lang": flores_lang,
-            "ctc":        ctc,
+            "ctc":         ctc,
         })
 
     return rows, None
@@ -180,18 +151,16 @@ def main():
     if not token:
         sys.exit("ERROR: set HF_TOKEN_READ environment variable")
 
-    api = HfApi()
-
-    # ── collect stems ─────────────────────────────────────────────────────────
-    print(f"Fetching tokenizer list from {TRI_REPO}...")
-    stems = get_repo_stems(api, TRI_REPO, token)
-    print(f"  {len(stems)} entries found")
+    # ── collect local .model files ────────────────────────────────────────────
+    model_files = sorted(glob.glob(os.path.join(SPM_DIR, "*.model")))
+    print(f"Found {len(model_files)} .model files in {SPM_DIR}/")
 
     jobs = []
-    for stem in stems:
+    for model_path in model_files:
+        stem = os.path.basename(model_path).replace(".model", "")
         info = parse_stem(stem)
         if info:
-            jobs.append((stem, info))
+            jobs.append((stem, model_path, info))
         else:
             print(f"  SKIP (unparseable): {stem}")
 
@@ -201,7 +170,7 @@ def main():
     if args.resume and os.path.exists(args.out):
         done = set(pd.read_csv(args.out)["tokenizer"].unique())
         before = len(jobs)
-        jobs = [(s, i) for s, i in jobs if s not in done]
+        jobs = [(s, p, i) for s, p, i in jobs if s not in done]
         print(f"Resuming: skipped {before - len(jobs)} done, {len(jobs)} remaining\n")
 
     # ── FLORES+ configs ───────────────────────────────────────────────────────
@@ -217,10 +186,10 @@ def main():
     total = len(jobs)
     done_count = err_count = 0
 
-    for i, (stem, info) in enumerate(jobs, 1):
+    for i, (stem, model_path, info) in enumerate(jobs, 1):
         print(f"[{i}/{total}] {stem}")
 
-        rows, err = process_one(stem, info, flores_configs, token)
+        rows, err = process_one(stem, model_path, info, flores_configs, token)
 
         if err:
             print(f"  {err}")
