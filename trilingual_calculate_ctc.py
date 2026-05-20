@@ -35,7 +35,13 @@ FLORES_REPO   = "openlanguagedata/flores_plus"
 FLORES_SPLITS = ["dev", "devtest"]
 TEXT_COLUMN   = "text"
 
-OUT_COLS = ["tokenizer", "l1", "l2", "l3", "r1", "r2", "r3", "flores_lang", "ctc"]
+# Fixed tokenizer settings used for all trilingual tokenizers
+TOK_TYPE   = "bpe"
+WHITESPACE = "whitespace"
+VOCAB_SIZE = 65536
+
+OUT_COLS = ["tokenizer", "l1", "l2", "l3", "r1", "r2", "r3",
+            "tok_type", "whitespace", "vocab_size", "flores_lang", "ctc"]
 
 
 # ── stem parsing ──────────────────────────────────────────────────────────────
@@ -131,6 +137,9 @@ def process_one(stem, model_path, info, flores_configs, token):
             "r1":          info["r1"],
             "r2":          info["r2"],
             "r3":          info["r3"],
+            "tok_type":    TOK_TYPE,
+            "whitespace":  WHITESPACE,
+            "vocab_size":  VOCAB_SIZE,
             "flores_lang": flores_lang,
             "ctc":         ctc,
         })
