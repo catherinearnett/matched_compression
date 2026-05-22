@@ -5,17 +5,17 @@ For each model stem in CUSTOM_MODELS_DIR:
   1. Load the stem's tokenizer
   2. Train a token-level bigram LM on the same tokenized training data
      (custom_tokenized_data/{stem}.txt — one space-separated token-id sequence per line)
-  3. Evaluate mean sentence NLL (bits, base-2) on FLORES devtest for both languages,
+  3. Evaluate mean sentence NLL (nats) on FLORES devtest for both languages,
      second-half-only, matching the GPT eval script exactly.
 
 Smoothing: stupid backoff (Brants et al. 2007)
   P_sb(w | c) = count(c,w)/count(c)          if count(c,w) > 0
               = λ * count(w)/N                otherwise   (λ = 0.40)
 
-NLL per token = -log2 P_sb(w | context)
-Mean sentence NLL = mean over second-half tokens (same masking as GPT script).
+NLL per token = -ln P_sb(w | context)
+Sent-NLL = raw sum of token NLLs in nats over second-half tokens.
 
-Output: bigram_flores_perplexity_results.csv
+Output: bigram_flores_nll_results.csv
   columns: model, flores_lang, mean_nll, se_nll, n_sequences
 """
 
@@ -38,7 +38,7 @@ LAMBDA_BACKOFF     = 0.40
 CUSTOM_MODELS_DIR  = "/mnt/ssd-3/catherine/bilingual_tokenizers/matched_compression/custom_models"
 TOKENIZED_DIR      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "custom_tokenized_data")
 TOKENIZERS_DIR     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "custom_tokenizers")
-CSV_PATH           = "bigram_flores_perplexity_results.csv"
+CSV_PATH           = "bigram_flores_nll_results.csv"
 
 FLORES_LANG_MAPPING = {
     'ace_Arab': 'urd_Arab', 'acm_Arab': 'arb_Arab', 'acq_Arab': 'arb_Arab',
@@ -56,7 +56,7 @@ FLORES_LANG_MAPPING = {
     'zsm_Latn': 'msa_Latn',
 }
 
-LOG2_LAMBDA = math.log2(LAMBDA_BACKOFF)
+LOG_LAMBDA = math.log(LAMBDA_BACKOFF)  # nats
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -70,14 +70,14 @@ def parse_langs_from_model_name(model_name):
 
 def load_tokenizer(stem):
     """Load tokenizer for a given stem from local TOKENIZERS_DIR."""
-    tok_dir = os.path.join(TOKENIZERS_DIR, stem)
+    tok_dir  = os.path.join(TOKENIZERS_DIR, stem)
     tok_json = os.path.join(tok_dir, 'tokenizer.json')
     if not os.path.isfile(tok_json):
         raise FileNotFoundError(f"No tokenizer.json at {tok_json}")
     try:
         return AutoTokenizer.from_pretrained(tok_dir, use_fast=True)
     except Exception:
-        base_tok = Tokenizer.from_file(tok_json)
+        base_tok  = Tokenizer.from_file(tok_json)
         tokenizer = PreTrainedTokenizerFast(tokenizer_object=base_tok)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
@@ -92,6 +92,7 @@ def build_bigram_counts(tokenized_file):
     Returns:
         unigram_counts : dict  token_id -> int
         bigram_counts  : dict  (context_id, token_id) -> int
+        context_totals : dict  context_id -> int
         total_tokens   : int
     """
     unigram_counts = defaultdict(int)
@@ -109,7 +110,6 @@ def build_bigram_counts(tokenized_file):
                 bigram_counts[(ctx, tok)] += 1
             total_tokens += len(ids)
 
-    # Pre-compute context totals for fast bigram probability lookup
     context_totals = defaultdict(int)
     for (ctx, tok), cnt in bigram_counts.items():
         context_totals[ctx] += cnt
@@ -117,22 +117,20 @@ def build_bigram_counts(tokenized_file):
     return unigram_counts, bigram_counts, context_totals, total_tokens
 
 
-def stupid_backoff_log2_prob(ctx, tok, unigram_counts, bigram_counts, context_totals, total_tokens):
+def stupid_backoff_log_prob(ctx, tok, unigram_counts, bigram_counts, context_totals, total_tokens):
     """
-    log2 P_sb(tok | ctx)
-    = log2(count(ctx,tok) / count(ctx))          if count(ctx,tok) > 0
-    = log2(λ) + log2(count(tok) / total_tokens)  otherwise
+    ln P_sb(tok | ctx)  — nats
+    = ln(count(ctx,tok) / count(ctx))          if count(ctx,tok) > 0
+    = ln(λ) + ln(count(tok) / total_tokens)    otherwise
     """
     bi_cnt = bigram_counts.get((ctx, tok), 0)
     if bi_cnt > 0:
-        return math.log2(bi_cnt) - math.log2(context_totals[ctx])
-    else:
-        uni_cnt = unigram_counts.get(tok, 0)
-        if uni_cnt > 0:
-            return LOG2_LAMBDA + math.log2(uni_cnt) - math.log2(total_tokens)
-        else:
-            # Unseen unigram: assign minimum probability (1/total like GPT unk handling)
-            return LOG2_LAMBDA + math.log2(1) - math.log2(total_tokens)
+        return math.log(bi_cnt) - math.log(context_totals[ctx])
+    uni_cnt = unigram_counts.get(tok, 0)
+    if uni_cnt > 0:
+        return LOG_LAMBDA + math.log(uni_cnt) - math.log(total_tokens)
+    # Unseen unigram: floor at 1 count
+    return LOG_LAMBDA + math.log(1) - math.log(total_tokens)
 
 
 def load_flores_lines(flores_lang_code, split, token):
@@ -158,17 +156,17 @@ def compute_bigram_sentence_nlls(tokenizer, lines,
                                   unigram_counts, bigram_counts,
                                   context_totals, total_tokens):
     """
-    Returns list of mean per-token NLL (bits) per sentence,
-    mirroring the GPT script's second-half masking exactly.
+    Returns one Sent-NLL value (raw sum of token NLLs in nats) per sequence,
+    matching the GPT eval script exactly.
     """
     prepend_token_id = (
         tokenizer.cls_token_id
         or tokenizer.bos_token_id
         or tokenizer.eos_token_id
     )
-    unk_token_id  = tokenizer.unk_token_id
-    vocab_size    = tokenizer.vocab_size
-    unk_nll       = math.log2(vocab_size) if vocab_size else 20.0  # fallback
+    unk_token_id = tokenizer.unk_token_id
+    vocab_size   = tokenizer.vocab_size
+    unk_nll      = math.log(vocab_size) if vocab_size else 20.0  # nats, matches GPT script
 
     nlls = []
 
@@ -184,15 +182,13 @@ def compute_bigram_sentence_nlls(tokenizer, lines,
         if len(ids) < 2:
             continue
 
-        # Second-half boundary (same logic as GPT script)
         if ONLY_SECOND_HALF:
             halfline     = line[: len(line) // 2]
             halfline_len = len(tokenizer(halfline, add_special_tokens=False)['input_ids'])
         else:
             halfline_len = 0
 
-        # Score positions 1..len(ids)-1  (predict ids[t] given ids[t-1])
-        token_nlls   = []
+        token_nlls       = []
         second_half_mask = []
 
         for t in range(1, len(ids)):
@@ -202,15 +198,14 @@ def compute_bigram_sentence_nlls(tokenizer, lines,
             if unk_token_id is not None and tok == unk_token_id:
                 nll = unk_nll
             else:
-                nll = -stupid_backoff_log2_prob(
+                nll = -stupid_backoff_log_prob(
                     ctx, tok,
                     unigram_counts, bigram_counts,
                     context_totals, total_tokens
                 )
 
             token_nlls.append(nll)
-            # t-1 because ids has prepend prepended; halfline_len counts original tokens
-            second_half_mask.append(t - 1 >= halfline_len)  # True = second half
+            second_half_mask.append(t - 1 >= halfline_len)
 
         if ONLY_SECOND_HALF:
             selected = [n for n, m in zip(token_nlls, second_half_mask) if m]
@@ -220,7 +215,7 @@ def compute_bigram_sentence_nlls(tokenizer, lines,
         if not selected:
             continue
 
-        nlls.append(np.mean(selected))
+        nlls.append(sum(selected))  # raw sum, not mean
 
     return nlls
 
@@ -241,7 +236,7 @@ token = os.environ.get("HF_TOKEN_READ")
 
 if os.path.isfile(CSV_PATH):
     existing_df = pd.read_csv(CSV_PATH)
-    existing_df['model']      = existing_df['model'].astype(str)
+    existing_df['model']       = existing_df['model'].astype(str)
     existing_df['flores_lang'] = existing_df['flores_lang'].astype(str)
     print(f"Loaded {len(existing_df)} existing rows from {CSV_PATH}")
 else:
@@ -254,7 +249,6 @@ model_names = sorted([
 ])
 print(f"Found {len(model_names)} model directories.")
 
-# Pre-load all needed FLORES sets
 all_lang_codes = set()
 for name in model_names:
     l1, l2 = parse_langs_from_model_name(name)
@@ -276,7 +270,6 @@ for model_name in model_names:
         print(f"\nSkipping {model_name} — could not parse language codes.")
         continue
 
-    # Derive stem: model_name IS the stem (same naming convention)
     stem           = model_name
     tokenized_file = os.path.join(TOKENIZED_DIR, f"{stem}.txt")
 
@@ -293,41 +286,37 @@ for model_name in model_names:
 
     print(f"\n{model_name}  |  langs: {lang1}, {lang2}")
 
-    # Load tokenizer
     try:
         tokenizer = load_tokenizer(stem)
     except Exception as e:
         print(f"  Could not load tokenizer: {e}")
         continue
 
-    # Build bigram counts from training data
     print(f"  Building bigram counts from {tokenized_file} ...")
     unigram_counts, bigram_counts, context_totals, total_tokens = build_bigram_counts(tokenized_file)
     print(f"  Unigrams: {len(unigram_counts):,}  Bigrams: {len(bigram_counts):,}  Tokens: {total_tokens:,}")
 
     for flores_code in needed:
         print(f"  Evaluating {flores_code} ...")
-        nlls = compute_bigram_sentence_nlls(
+        nlls     = compute_bigram_sentence_nlls(
             tokenizer, flores_sentences[flores_code],
             unigram_counts, bigram_counts, context_totals, total_tokens
         )
         mean_nll = float(np.mean(nlls))
         se_nll   = float(np.std(nlls, ddof=1) / np.sqrt(len(nlls)))
-        print(f"  {flores_code} mean NLL: {mean_nll:.4f} ± {se_nll:.4f} bits/token")
+        print(f"  {flores_code} mean Sent-NLL: {mean_nll:.4f} ± {se_nll:.4f} nats")
         new_rows.append({
-            'model':        model_name,
-            'flores_lang':  flores_code,
-            'mean_nll':     mean_nll,
-            'se_nll':       se_nll,
-            'n_sequences':  len(nlls),
+            'model':       model_name,
+            'flores_lang': flores_code,
+            'mean_nll':    mean_nll,
+            'se_nll':      se_nll,
+            'n_sequences': len(nlls),
         })
 
-    # Discard counts immediately — no saving
     del unigram_counts, bigram_counts, context_totals
 
-# Save
-new_df    = pd.DataFrame(new_rows)
-combined  = pd.concat([existing_df, new_df], ignore_index=True)
+new_df   = pd.DataFrame(new_rows)
+combined = pd.concat([existing_df, new_df], ignore_index=True)
 combined.to_csv(CSV_PATH, index=False)
 print(f"\nSaved {len(combined)} total rows to {CSV_PATH}")
 print(combined)
