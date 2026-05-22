@@ -44,15 +44,18 @@ def parse_langs_from_model_name(model_name):
     return None, None
 
 
-def get_local_checkpoints(model_dir):
-    """Return sorted checkpoint subdirs plus the model root ('main')."""
-    checkpoints = sorted(
-        [d for d in os.listdir(model_dir)
-         if os.path.isdir(os.path.join(model_dir, d)) and d.startswith('checkpoint-')],
-        key=lambda x: int(x.split('-')[-1])
-    )
-    return checkpoints + ['main']
+# def get_local_checkpoints(model_dir):
+#     """Return sorted checkpoint subdirs plus the model root ('main')."""
+#     checkpoints = sorted(
+#         [d for d in os.listdir(model_dir)
+#          if os.path.isdir(os.path.join(model_dir, d)) and d.startswith('checkpoint-')],
+#         key=lambda x: int(x.split('-')[-1])
+#     )
+#     return checkpoints + ['main']
 
+def get_local_checkpoints(model_dir):
+    """Return only the final model checkpoint."""
+    return ['main']
 
 def load_tokenizer_and_model(model_dir, checkpoint):
     """Load tokenizer and model from a local checkpoint (or model root if 'main')."""
