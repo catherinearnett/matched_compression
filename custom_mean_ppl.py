@@ -15,7 +15,7 @@ FLORES_SPLIT = "devtest"
 MAX_SEQ_LEN = 512
 ONLY_SECOND_HALF = True
 CUSTOM_MODELS_DIR = "/mnt/ssd-3/catherine/bilingual_tokenizers/matched_compression/custom_models"
-CSV_PATH = "flores_perplexity_results.csv"
+CSV_PATH = "flores_nll_results.csv"
 
 FLORES_LANG_MAPPING = {
     'ace_Arab': 'urd_Arab', 'acm_Arab': 'arb_Arab', 'acq_Arab': 'arb_Arab',
@@ -108,8 +108,8 @@ def load_flores_lines(flores_lang_code, split, token):
         return None
 
 
-def compute_sequence_perplexities(tokenizer, model, lines):
-    """Returns one perplexity value per sequence."""
+def compute_sequence_nlls(tokenizer, model, lines):
+    """Returns one Sent-NLL value (raw sum of token NLLs in nats) per sequence."""
     loss_fn = nn.CrossEntropyLoss(
         ignore_index=(-100 if tokenizer.pad_token_id is None else tokenizer.pad_token_id),
         reduction='none'
@@ -124,7 +124,7 @@ def compute_sequence_perplexities(tokenizer, model, lines):
     if not use_prepend:
         print("  Warning: no CLS/BOS/EOS token found, skipping prepend token.")
 
-    sequence_perplexities = []
+    sequence_nlls = []
 
     for line in tqdm(lines, leave=False):
         inputs = tokenizer([line], add_special_tokens=False)
@@ -152,26 +152,20 @@ def compute_sequence_perplexities(tokenizer, model, lines):
         labels = input_ids[:, 1:]
         logits = logits[:, :-1, :]
         logits = torch.transpose(logits, 1, 2)
-        losses = loss_fn(logits, labels).cpu() * np.log2(np.e)
+        losses = loss_fn(logits, labels).cpu()  # nats, no conversion
 
         if unk_token_id is not None:
-            losses[labels.cpu() == unk_token_id] = np.log2(tokenizer.vocab_size)
+            losses[labels.cpu() == unk_token_id] = np.log(tokenizer.vocab_size)  # nats
 
         if ONLY_SECOND_HALF:
             halfline = line[:(len(line) // 2)]
             halfline_len = len(tokenizer([halfline], add_special_tokens=False)['input_ids'][0])
             losses[0, :halfline_len] = 0.0
 
-        n_tokens = (labels[0] != (tokenizer.pad_token_id or -100)).sum().item()
-        if ONLY_SECOND_HALF:
-            halfline = line[:(len(line) // 2)]
-            halfline_len = len(tokenizer([halfline], add_special_tokens=False)['input_ids'][0])
-            n_tokens = max(n_tokens - halfline_len, 1)
+        sentence_nll = losses[0].sum().item()
+        sequence_nlls.append(sentence_nll)
 
-        mean_surprisal = losses[0].sum().item() / n_tokens
-        sequence_perplexities.append(2 ** mean_surprisal)
-
-    return sequence_perplexities
+    return sequence_nlls
 
 
 def already_done(existing_df, model_name, ckpt, flores_code):
@@ -255,19 +249,19 @@ for model_name in model_names:
 
         for flores_code in needed:
             print(f"  Evaluating {flores_code} ...")
-            ppls = compute_sequence_perplexities(tokenizer, model, flores_sentences[flores_code])
-            mean_ppl = np.mean(ppls)
-            se_ppl = np.std(ppls, ddof=1) / np.sqrt(len(ppls))
-            print(f"  {flores_code} perplexity: {mean_ppl:.2f} ± {se_ppl:.2f}")
+            nlls = compute_sequence_nlls(tokenizer, model, flores_sentences[flores_code])
+            mean_nll = np.mean(nlls)
+            se_nll = np.std(nlls, ddof=1) / np.sqrt(len(nlls))
+            print(f"  {flores_code} mean Sent-NLL: {mean_nll:.4f} ± {se_nll:.4f}")
             step = int(ckpt.split('-')[-1]) if ckpt.startswith('checkpoint-') else None
             new_rows.append({
                 'model': model_name,
                 'checkpoint': ckpt,
                 'step': step,
                 'flores_lang': flores_code,
-                'mean_perplexity': mean_ppl,
-                'se_perplexity': se_ppl,
-                'n_sequences': len(ppls),
+                'mean_nll': mean_nll,
+                'se_nll': se_nll,
+                'n_sequences': len(nlls),
             })
 
         del model
