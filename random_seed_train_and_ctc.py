@@ -7,8 +7,9 @@ For each language × subset × model_type × whitespace combo:
   3. Append result to ctc_random_results.csv
 
 Dataset source: catherinearnett/bilingual-tokenizer-training-data
-  Files named like: afr_Latn_subset_1, afr_Latn_subset_2, ...
+  Configs named like: afr_Latn_subset_1, afr_Latn_subset_2, ...
   Each subset is a different data seed for the same language.
+  Each config contains parquet shards loaded via load_dataset().
 
 Output:
   spm_tokenizers_monolingual/  — trained .model and .vocab files
@@ -20,7 +21,7 @@ Usage:
     python train_monolingual_tokenizers.py
 
 Requirements:
-    pip install sentencepiece transformers datasets huggingface_hub pandas
+    pip install sentencepiece datasets huggingface_hub pandas
 """
 
 import sentencepiece as spm
@@ -29,7 +30,7 @@ import sys
 import traceback
 import pandas as pd
 from datetime import datetime
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi
 from datasets import load_dataset, get_dataset_config_names
 import warnings
 warnings.filterwarnings("ignore")
@@ -64,53 +65,65 @@ def log_error(label, exc):
 
 def discover_datasets(token):
     """
-    List files in the HF training data repo.
-    Expects filenames like: afr_Latn_subset_1[.txt[.gz]]
-    Returns list of (lang, repo_path) tuples. The subset number is encoded
-    in the tokenizer name but not tracked as a separate field.
+    Discover dataset configs by listing top-level directories in the HF repo.
+    Each directory is a config named afr_Latn_subset_1, etc.
+    Returns list of (lang, subset, config_name) tuples.
     """
     api = HfApi()
-    print(f"Listing files in {DATA_REPO} ...")
+    print(f"Listing configs in {DATA_REPO} ...")
     all_files = list(api.list_repo_files(
         repo_id=DATA_REPO, repo_type="dataset", token=token
     ))
+    seen = set()
     datasets = []
     for f in all_files:
-        basename = os.path.basename(f)
-        name = basename.split(".")[0]  # strip all extensions
-        parts = name.split("_subset_")
-        if len(parts) == 2:
-            lang   = parts[0]   # e.g. afr_Latn
-            subset = parts[1]   # e.g. 1, 2, 3
-            datasets.append((lang, subset, f))
-    print(f"  Found {len(datasets)} dataset files.")
+        # paths look like: afr_Latn_subset_1/train-00000-of-00002.parquet
+        top = f.split("/")[0]
+        if top in seen or "_subset_" not in top:
+            continue
+        seen.add(top)
+        parts = top.split("_subset_")
+        lang   = parts[0]   # e.g. afr_Latn
+        subset = parts[1]   # e.g. 1, 2, 3
+        datasets.append((lang, subset, top))
+    print(f"  Found {len(datasets)} configs.")
     return datasets
 
 
-def download_dataset(repo_path, token):
-    """Download a dataset file from HF to DATA_DIR; return local path."""
-    local_path = os.path.join(DATA_DIR, os.path.basename(repo_path))
-    if os.path.exists(local_path):
-        return local_path
-    print(f"  Downloading {repo_path} ...")
-    downloaded = hf_hub_download(
-        repo_id=DATA_REPO,
-        filename=repo_path,
-        repo_type="dataset",
-        local_dir=DATA_DIR,
-        token=token,
-    )
-    return downloaded
+_data_cache = {}
+
+def load_training_text(config_name, token):
+    """
+    Load training data for a config via load_dataset (parquet shards).
+    Writes sentences to DATA_DIR/<config_name>.txt for SPM input.
+    Returns the local .txt path.
+    """
+    if config_name in _data_cache:
+        return _data_cache[config_name]
+    local_path = os.path.join(DATA_DIR, f"{config_name}.txt")
+    if not os.path.exists(local_path):
+        print(f"  Downloading {config_name} ...")
+        ds = load_dataset(DATA_REPO, config_name, split="train",
+                          token=token, trust_remote_code=False)
+        text_col = next(
+            (c for c in ["text", "sentence"] if c in ds.column_names),
+            ds.column_names[0]
+        )
+        with open(local_path, "w", encoding="utf-8") as f:
+            for row in ds[text_col]:
+                f.write(row.strip() + "\n")
+    _data_cache[config_name] = local_path
+    return local_path
 
 # ── job building ──────────────────────────────────────────────────────────────
 
 def build_jobs(datasets, done_tokenizers):
     """
-    For each (lang, subset, file), produce 4 jobs: bpe/unigram × whitespace/nowhitespace.
+    For each (lang, subset, config), produce 4 jobs: bpe/unigram × whitespace/nowhitespace.
     Skip if tokenizer name is already in done_tokenizers (CTC already computed).
     """
     jobs = []
-    for lang, subset, repo_path in datasets:
+    for lang, subset, config_name in datasets:
         for model_type in ["bpe", "unigram"]:
             for split_by_whitespace in [True, False]:
                 pretok = "whitespace" if split_by_whitespace else "nowhitespace"
@@ -118,7 +131,7 @@ def build_jobs(datasets, done_tokenizers):
                 if tokenizer_name in done_tokenizers:
                     continue
                 jobs.append({
-                    "repo_path":           repo_path,
+                    "config_name":         config_name,
                     "tokenizer_name":      tokenizer_name,
                     "lang":                lang,
                     "model_type":          model_type,
@@ -165,7 +178,7 @@ def load_flores_sentences(lang, token, flores_configs):
 # ── CTC ───────────────────────────────────────────────────────────────────────
 
 def compute_ctc_spm(sentences, sp):
-    """Compute CTC using a raw SentencePieceProcessor (no special token ids)."""
+    """Compute CTC using a raw SentencePieceProcessor."""
     total = 0
     for sent in sentences:
         total += len(sp.EncodeAsIds(sent))
@@ -186,7 +199,7 @@ def run_job(job, token, flores_configs):
     # 1. Train
     if not os.path.exists(spm_path):
         try:
-            local_data = download_dataset(job["repo_path"], token)
+            local_data = load_training_text(job["config_name"], token)
             spm.SentencePieceTrainer.train(
                 input=local_data,
                 model_prefix=os.path.join(SPM_DIR, tokenizer_name),
@@ -277,8 +290,8 @@ def main():
 
     counts = {"done": 0, "failed": 0}
 
-    # Sequential: FLORES sentences are cached in memory per language, so
-    # all 4 tokenizer variants for a language reuse the same loaded sentences.
+    # Sequential: FLORES sentences and training text are cached in memory,
+    # so all 4 variants for a (lang, subset) reuse the same loaded data.
     for i, job in enumerate(jobs, 1):
         print(f"[{i}/{total}] {job['tokenizer_name']}")
         status, tokenizer_name, row, err = run_job(job, token, flores_configs)
