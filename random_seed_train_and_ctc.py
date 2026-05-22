@@ -11,6 +11,12 @@ Dataset source: catherinearnett/bilingual-tokenizer-training-data
   Each subset is a different data seed for the same language.
   Each config contains parquet shards loaded via load_dataset().
 
+Strategy:
+  - Main process pre-downloads all training text files before spawning workers.
+  - Workers train + compute CTC in parallel. Each worker loads FLORES from the
+    HF datasets disk cache (populated on first access), so no redundant downloads.
+  - Results are written to CSV in the main process as futures complete.
+
 Output:
   spm_tokenizers_monolingual/  — trained .model and .vocab files
   ctc_random_results.csv       — columns:
@@ -30,6 +36,7 @@ import sys
 import traceback
 import pandas as pd
 from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from huggingface_hub import HfApi
 from datasets import load_dataset, get_dataset_config_names
 import warnings
@@ -42,11 +49,12 @@ FLORES_REPO   = "openlanguagedata/flores_plus"
 FLORES_SPLITS = ["dev", "devtest"]
 TEXT_COLUMN   = "sentence"
 
-SPM_DIR    = "spm_tokenizers_monolingual"
-DATA_DIR   = "monolingual_data"
-LOG_FILE   = "tokenizer_errors.txt"
-CTC_OUT    = "ctc_random_results.csv"
-VOCAB_SIZE = 65536
+SPM_DIR     = "spm_tokenizers_monolingual"
+DATA_DIR    = "monolingual_data"
+LOG_FILE    = "tokenizer_errors.txt"
+CTC_OUT     = "ctc_random_results.csv"
+VOCAB_SIZE  = 65536
+NUM_WORKERS = 4
 
 CTC_COLS = ["tokenizer", "lang", "tok_type", "whitespace",
             "vocab_size", "flores_lang", "ctc"]
@@ -77,51 +85,42 @@ def discover_datasets(token):
     seen = set()
     datasets = []
     for f in all_files:
-        # paths look like: afr_Latn_subset_1/train-00000-of-00002.parquet
         top = f.split("/")[0]
         if top in seen or "_subset_" not in top:
             continue
         seen.add(top)
         parts = top.split("_subset_")
-        lang   = parts[0]   # e.g. afr_Latn
-        subset = parts[1]   # e.g. 1, 2, 3
+        lang   = parts[0]
+        subset = parts[1]
         datasets.append((lang, subset, top))
     print(f"  Found {len(datasets)} configs.")
     return datasets
 
 
-_data_cache = {}
-
-def load_training_text(config_name, token):
+def download_training_text(config_name, token):
     """
     Load training data for a config via load_dataset (parquet shards).
     Writes sentences to DATA_DIR/<config_name>.txt for SPM input.
-    Returns the local .txt path.
+    Returns the local .txt path. Safe to call multiple times (idempotent).
     """
-    if config_name in _data_cache:
-        return _data_cache[config_name]
     local_path = os.path.join(DATA_DIR, f"{config_name}.txt")
-    if not os.path.exists(local_path):
-        print(f"  Downloading {config_name} ...")
-        ds = load_dataset(DATA_REPO, config_name, split="train",
-                          token=token, trust_remote_code=False)
-        text_col = next(
-            (c for c in ["text", "sentence"] if c in ds.column_names),
-            ds.column_names[0]
-        )
-        with open(local_path, "w", encoding="utf-8") as f:
-            for row in ds[text_col]:
-                f.write(row.strip() + "\n")
-    _data_cache[config_name] = local_path
+    if os.path.exists(local_path):
+        return local_path
+    print(f"  Downloading {config_name} ...")
+    ds = load_dataset(DATA_REPO, config_name, split="train",
+                      token=token, trust_remote_code=False)
+    text_col = next(
+        (c for c in ["text", "sentence"] if c in ds.column_names),
+        ds.column_names[0]
+    )
+    with open(local_path, "w", encoding="utf-8") as f:
+        for row in ds[text_col]:
+            f.write(row.strip() + "\n")
     return local_path
 
 # ── job building ──────────────────────────────────────────────────────────────
 
 def build_jobs(datasets, done_tokenizers):
-    """
-    For each (lang, subset, config), produce 4 jobs: bpe/unigram × whitespace/nowhitespace.
-    Skip if tokenizer name is already in done_tokenizers (CTC already computed).
-    """
     jobs = []
     for lang, subset, config_name in datasets:
         for model_type in ["bpe", "unigram"]:
@@ -140,28 +139,11 @@ def build_jobs(datasets, done_tokenizers):
                 })
     return jobs
 
-# ── FLORES helpers ────────────────────────────────────────────────────────────
-
-_flores_configs = None
-_flores_cache   = {}
-
-def get_flores_configs(token):
-    global _flores_configs
-    if _flores_configs is not None:
-        return _flores_configs
-    try:
-        _flores_configs = set(get_dataset_config_names(FLORES_REPO, token=token))
-    except Exception as e:
-        print(f"WARNING: could not fetch FLORES+ configs: {e}")
-        _flores_configs = set()
-    return _flores_configs
-
+# ── FLORES helpers (called inside workers) ───────────────────────────────────
 
 def load_flores_sentences(lang, token, flores_configs):
-    if lang in _flores_cache:
-        return _flores_cache[lang]
+    """Load FLORES+ sentences for a language. Uses HF datasets disk cache."""
     if lang not in flores_configs:
-        _flores_cache[lang] = None
         return None
     sentences = []
     for split in FLORES_SPLITS:
@@ -171,20 +153,17 @@ def load_flores_sentences(lang, token, flores_configs):
             sentences.extend(ds[TEXT_COLUMN])
         except Exception as e:
             print(f"  WARNING: could not load FLORES+ {lang}/{split}: {e}")
-    result = sentences if sentences else None
-    _flores_cache[lang] = result
-    return result
+    return sentences if sentences else None
 
 # ── CTC ───────────────────────────────────────────────────────────────────────
 
 def compute_ctc_spm(sentences, sp):
-    """Compute CTC using a raw SentencePieceProcessor."""
     total = 0
     for sent in sentences:
         total += len(sp.EncodeAsIds(sent))
     return total
 
-# ── training + CTC ────────────────────────────────────────────────────────────
+# ── worker function (runs in subprocess) ─────────────────────────────────────
 
 def run_job(job, token, flores_configs):
     """
@@ -195,11 +174,11 @@ def run_job(job, token, flores_configs):
     """
     tokenizer_name = job["tokenizer_name"]
     spm_path = os.path.join(SPM_DIR, f"{tokenizer_name}.model")
+    local_data = os.path.join(DATA_DIR, f"{job['config_name']}.txt")
 
     # 1. Train
     if not os.path.exists(spm_path):
         try:
-            local_data = load_training_text(job["config_name"], token)
             spm.SentencePieceTrainer.train(
                 input=local_data,
                 model_prefix=os.path.join(SPM_DIR, tokenizer_name),
@@ -232,7 +211,7 @@ def run_job(job, token, flores_configs):
     ctc_value = None
 
     if sentences is None:
-        flores_lang = None  # language not in FLORES+
+        flores_lang = None
     else:
         try:
             ctc_value = compute_ctc_spm(sentences, sp)
@@ -278,34 +257,52 @@ def main():
     datasets = discover_datasets(token)
     jobs = build_jobs(datasets, done_tokenizers)
     total = len(jobs)
-    print(f"Total jobs: {total}\n")
+    print(f"Total jobs: {total} | Workers: {NUM_WORKERS}\n")
 
     if total == 0:
         print("All tokenizers trained and CTC computed. Nothing to do.")
         sys.exit(0)
 
+    # Pre-download all training text files sequentially in the main process
+    # before spawning workers, so workers never race on the same download.
+    print("Pre-downloading training data...")
+    needed_configs = {job["config_name"] for job in jobs}
+    for config_name in sorted(needed_configs):
+        download_training_text(config_name, token)
+    print(f"  All {len(needed_configs)} configs ready.\n")
+
+    # Pre-fetch FLORES+ config list and warm the disk cache for all languages
+    # that appear in our jobs, so workers hit disk rather than network.
     print("Fetching FLORES+ language configs...")
-    flores_configs = get_flores_configs(token)
-    print(f"  {len(flores_configs)} configs available\n")
+    flores_configs = set(get_dataset_config_names(FLORES_REPO, token=token))
+    print(f"  {len(flores_configs)} configs available.")
+
+    needed_langs = {job["lang"] for job in jobs} & flores_configs
+    print(f"  Pre-caching FLORES+ sentences for {len(needed_langs)} languages...")
+    for lang in sorted(needed_langs):
+        load_flores_sentences(lang, token, flores_configs)
+    print()
 
     counts = {"done": 0, "failed": 0}
 
-    # Sequential: FLORES sentences and training text are cached in memory,
-    # so all 4 variants for a (lang, subset) reuse the same loaded data.
-    for i, job in enumerate(jobs, 1):
-        print(f"[{i}/{total}] {job['tokenizer_name']}")
-        status, tokenizer_name, row, err = run_job(job, token, flores_configs)
-        counts[status] += 1
+    with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        futures = {
+            executor.submit(run_job, job, token, flores_configs): job
+            for job in jobs
+        }
+        for future in as_completed(futures):
+            status, tokenizer_name, row, err = future.result()
+            counts[status] += 1
 
-        if status == "done":
-            pd.DataFrame([row]).to_csv(CTC_OUT, mode="a", header=False, index=False)
-            ctc_str = f"ctc={row['ctc']}" if row["ctc"] is not None else "ctc=N/A (not in FLORES+)"
-            print(f"  ✓ {ctc_str}")
-        else:
-            print(f"  ✗ {err}")
+            if status == "done":
+                pd.DataFrame([row]).to_csv(CTC_OUT, mode="a", header=False, index=False)
+                ctc_str = f"ctc={row['ctc']}" if row["ctc"] is not None else "ctc=N/A (not in FLORES+)"
+                print(f"[DONE] {tokenizer_name}  {ctc_str}")
+            else:
+                print(f"[FAIL] {tokenizer_name}  {err}")
 
-        d, f_ = counts["done"], counts["failed"]
-        print(f"  Progress: {d+f_}/{total}  (✓ {d}  ✗ {f_})")
+            d, f_ = counts["done"], counts["failed"]
+            print(f"  Progress: {d+f_}/{total}  (✓ {d}  ✗ {f_})")
 
     d, f_ = counts["done"], counts["failed"]
     print(f"\nDone. Completed: {d}  Failed: {f_}")
